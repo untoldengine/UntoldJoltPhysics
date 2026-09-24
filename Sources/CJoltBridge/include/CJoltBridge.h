@@ -5,9 +5,10 @@
 //  C API over Jolt Physics for the Untold Engine physics backend plugin.
 //  Deliberately narrow: it mirrors the engine's PhysicsBackend protocol
 //  (bodies in, kinematic targets in, step, transforms out, buffered events
-//  out, one raycast) so the Swift side stays a thin adapter. All functions
-//  except the event drains must be called from one thread (the engine's
-//  frame thread); Jolt's own worker threads never call back into Swift.
+//  out, one raycast) so the Swift side stays a thin adapter, plus the plugin's
+//  own extras (soft bodies, a character controller). All functions except
+//  the event drains must be called from one thread (the engine's frame
+//  thread); Jolt's own worker threads never call back into Swift.
 //
 
 #ifndef CJOLTBRIDGE_H
@@ -200,6 +201,83 @@ uint32_t ujolt_world_drain_activations(ujolt_world *world, ujolt_activation_even
 int32_t ujolt_world_cast_ray(const ujolt_world *world, const float origin[3], const float direction[3], float max_distance,
                              uint32_t layer_mask, const uint64_t *excluded_user_data, uint32_t excluded_count,
                              ujolt_ray_hit *out_hit);
+
+/* Character controller (Jolt's CharacterVirtual): a shape the game moves
+   with a velocity every frame. It collides-and-slides against the static
+   environment and the rigid bodies, pushes dynamic ones, and reports the
+   corrected position. The world step never moves it: the game calls
+   ujolt_character_move between steps, on the frame thread. */
+typedef struct ujolt_character ujolt_character;
+
+typedef enum ujolt_character_shape {
+    UJOLT_CHARACTER_CAPSULE = 0,
+    UJOLT_CHARACTER_CYLINDER = 1
+} ujolt_character_shape;
+
+typedef enum ujolt_ground_state {
+    UJOLT_GROUND_ON_GROUND = 0,
+    UJOLT_GROUND_ON_STEEP_GROUND = 1,
+    UJOLT_GROUND_NOT_SUPPORTED = 2,
+    UJOLT_GROUND_IN_AIR = 3
+} ujolt_ground_state;
+
+typedef struct ujolt_character_desc {
+    ujolt_character_shape shape;
+    float radius;
+    float height;                      /* total height, base (feet) to top; a capsule needs >= 2 * radius */
+    float position[3];                 /* the base of the shape (the feet) */
+    float rotation[4];                 /* x, y, z, w */
+    uint32_t layer;                    /* engine collision layer 0..31 */
+    uint64_t user_data;                /* the engine entity id; contacts and ray hits report it */
+    float mass;                        /* kg, presses down on what the character stands on; 0 never does; < 0 -> 70 */
+    float max_strength;                /* N, the most force applied to a pushed dynamic body; 0 never pushes; < 0 -> 100 */
+    float padding;                     /* <= 0 -> 0.02 m; the distance kept from every surface */
+    float predictive_contact_distance; /* <= 0 -> 0.1 m; 0 would make the character stick */
+    float max_slope_degrees;           /* contacts steeper than this are walls; 0 makes every contact a wall; < 0 -> 50 */
+    float penetration_recovery_speed;  /* <= 0 -> 1; fraction of a penetration resolved per move */
+    int32_t inner_body;                /* 0/1: a kinematic body inside the shape, so dynamic bodies
+                                          bounce off the character and rays hit it (registered with
+                                          user_data; never read back, removed with the character) */
+    float inner_body_fraction;         /* <= 0 -> 0.9 of the outer shape */
+    int32_t pushed_by_dynamic_bodies;  /* 0/1: whether dynamic bodies may shove the character. Off, a
+                                          ball resting against it or hitting it never moves it, while
+                                          the character still pushes the ball; kinematic bodies (a
+                                          tracked hand) push it either way */
+    float stick_to_floor_step_down;    /* metres the character may snap down to stay on a floor; 0 -> off */
+    float walk_stairs_step_up;         /* metres the character may step up; 0 -> off */
+} ujolt_character_desc;
+
+/// A contact of the character with a body. Trigger volumes are never listed:
+/// the character passes through them.
+typedef struct ujolt_character_contact {
+    uint64_t user_data;   /* the other body's entity (UJOLT_NO_ENTITY for environment geometry) */
+    float position[3];
+    float normal[3];      /* points towards the character */
+    float distance;       /* <= 0 touching or penetrating, > 0 a predicted contact ahead */
+    int32_t is_dynamic;
+    int32_t had_collision;/* 1 when the last move actually collided with it */
+} ujolt_character_contact;
+
+ujolt_character *ujolt_world_add_character(ujolt_world *world, const ujolt_character_desc *desc);
+void ujolt_world_remove_character(ujolt_world *world, ujolt_character *character);
+/// Moves by velocity * dt with collide-and-slide. Gravity only presses on
+/// whatever the character stands on (pass zeros when the game owns the
+/// height); it is never added to the character's velocity. Frame thread,
+/// between steps.
+void ujolt_character_move(ujolt_character *character, const float velocity[3], float dt, const float gravity[3]);
+/// Teleports the base; the contacts are recomputed.
+void ujolt_character_set_position(ujolt_character *character, const float position[3]);
+void ujolt_character_set_rotation(ujolt_character *character, const float rotation[4]);
+void ujolt_character_get_position(const ujolt_character *character, float position[3]);
+/// The velocity the last move actually produced — the displacement over its
+/// dt, after sliding and stopping — not the one asked for. Zero before any move.
+void ujolt_character_get_velocity(const ujolt_character *character, float velocity[3]);
+int32_t ujolt_character_ground_state(const ujolt_character *character);
+/// The contacts the last move found. Writes up to capacity of them and
+/// returns the TOTAL count, so a caller can grow its buffer and ask again.
+uint32_t ujolt_character_contacts(const ujolt_character *character, ujolt_character_contact *out, uint32_t capacity);
+/// The inner body, or UJOLT_INVALID_BODY when the character has none.
+ujolt_body_id ujolt_character_inner_body(const ujolt_character *character);
 
 #ifdef __cplusplus
 }

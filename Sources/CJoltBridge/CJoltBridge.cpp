@@ -19,6 +19,7 @@
 #include <Jolt/Physics/Body/BodyCreationSettings.h>
 #include <Jolt/Physics/Body/BodyFilter.h>
 #include <Jolt/Physics/Body/BodyLock.h>
+#include <Jolt/Physics/Character/CharacterVirtual.h>
 #include <Jolt/Physics/Collision/BroadPhase/BroadPhaseLayerInterfaceTable.h>
 #include <Jolt/Physics/Collision/CastResult.h>
 #include <Jolt/Physics/Collision/ContactListener.h>
@@ -78,6 +79,10 @@ struct BodyRecord {
     bool sensor;
     EMotionType motion;
     bool soft = false;
+    /// A character controller's inner body: owned by the character (which
+    /// removes and destroys it), listed here so contacts and rays resolve
+    /// to the character's user data.
+    bool inner = false;
 };
 
 struct KinematicTarget {
@@ -108,6 +113,31 @@ void ensureJoltRegistered() {
 }
 
 } // namespace
+
+/// A Jolt CharacterVirtual and what its moves need. Owned by the world it
+/// was added to (released before the world's bodies on destruction).
+struct ujolt_character final : public CharacterContactListener {
+    ujolt_world *world = nullptr;
+    Ref<CharacterVirtual> character;
+    ObjectLayer layer = 0;
+    CharacterVirtual::ExtendedUpdateSettings extended;
+    ujolt_body_id innerBody = UJOLT_INVALID_BODY;
+    bool pushedByDynamicBodies = false;
+    /// What the last move produced: displacement over its dt.
+    Vec3 effectiveVelocity = Vec3::sZero();
+
+    // Synchronous, on the thread running the move. With mCanPushCharacter
+    // off Jolt drops the constraint's velocity (the body's own and the
+    // penetration recovery), so a dynamic body neither shoves the character
+    // nor nudges it out of a resting touch; the constraint plane still stops
+    // the character walking through it, and the impulse on the body stays.
+    void OnContactAdded(const CharacterVirtual *, const CharacterContact &contact, CharacterContactSettings &settings) override {
+        settings.mCanPushCharacter = pushedByDynamicBodies || contact.mMotionTypeB != EMotionType::Dynamic;
+    }
+    void OnContactPersisted(const CharacterVirtual *, const CharacterContact &contact, CharacterContactSettings &settings) override {
+        settings.mCanPushCharacter = pushedByDynamicBodies || contact.mMotionTypeB != EMotionType::Dynamic;
+    }
+};
 
 struct ujolt_world final : public ContactListener, public BodyActivationListener {
     ujolt_world(const ujolt_world_desc &desc)
@@ -148,6 +178,11 @@ struct ujolt_world final : public ContactListener, public BodyActivationListener
     ~ujolt_world() override {
         system.SetContactListener(nullptr);
         system.SetBodyActivationListener(nullptr);
+        // Characters own their inner bodies (the CharacterVirtual destructor
+        // removes and destroys them): release them before the body sweep
+        // below, and while the PhysicsSystem is still alive.
+        for (ujolt_character *character : characters) releaseCharacter(character, false);
+        characters.clear();
         BodyInterface &bi = system.GetBodyInterface();
         for (auto &entry : records) {
             BodyID id(entry.first);
@@ -202,6 +237,23 @@ struct ujolt_world final : public ContactListener, public BodyActivationListener
         }
         out = it->second;
         return true;
+    }
+
+    // MARK: Characters (frame thread)
+
+    /// Forgets the character's inner body (as a tombstone when `keepTombstone`,
+    /// so an in-flight OnContactRemoved still resolves it) and deletes the
+    /// character, whose destructor removes and destroys the inner body.
+    void releaseCharacter(ujolt_character *character, bool keepTombstone) {
+        if (character->innerBody != UJOLT_INVALID_BODY) {
+            std::lock_guard<std::mutex> guard(recordMutex);
+            auto it = records.find(character->innerBody);
+            if (it != records.end()) {
+                if (keepTombstone) removedRecords[character->innerBody] = it->second;
+                records.erase(it);
+            }
+        }
+        delete character;
     }
 
     // MARK: ContactListener (Jolt worker threads)
@@ -331,6 +383,7 @@ struct ujolt_world final : public ContactListener, public BodyActivationListener
     std::vector<uint32_t> removedSinceLastStep;
 
     std::vector<KinematicTarget> kinematicTargets;
+    std::unordered_set<ujolt_character *> characters;
 
     std::mutex eventMutex;
     std::unordered_set<uint64_t> reportedPairs;
@@ -583,6 +636,7 @@ void ujolt_world_remove_body(ujolt_world *world, ujolt_body_id body) {
         std::lock_guard<std::mutex> guard(world->recordMutex);
         auto it = world->records.find(body);
         if (it == world->records.end()) return;
+        if (it->second.inner) return; // owned by its character; goes with it
         world->removedRecords[body] = it->second;
         world->records.erase(it);
     }
@@ -789,6 +843,156 @@ int32_t ujolt_world_cast_ray(const ujolt_world *world, const float origin[3], co
     store3(out_hit->normal, normal);
     out_hit->distance = hit.mFraction * max_distance;
     return 1;
+}
+
+} // extern "C"
+
+// MARK: - Character controller
+
+namespace {
+
+/// A capsule or cylinder standing on the origin (CharacterVirtual wants the
+/// base of the shape at (0, 0, 0)), `fraction` of the requested size but
+/// sharing its centre, so an inner body sits inside the outer shape.
+RefConst<Shape> characterShape(ujolt_character_shape kind, float radius, float height, float fraction) {
+    const float r = std::max(radius * fraction, 1e-3f);
+    const float h = std::max(height * fraction, 2.0f * r + 1e-3f);
+    RefConst<Shape> shape;
+    if (kind == UJOLT_CHARACTER_CYLINDER) {
+        const float halfHeight = h * 0.5f;
+        shape = new CylinderShape(halfHeight, r, std::min(cDefaultConvexRadius, std::min(halfHeight, r)));
+    } else {
+        shape = new CapsuleShape(h * 0.5f - r, r);
+    }
+    return new RotatedTranslatedShape(Vec3(0.0f, height * 0.5f, 0.0f), Quat::sIdentity(), shape);
+}
+
+/// Fields Jolt cannot take at zero fall back to the default at or below zero.
+inline float orDefault(float value, float fallback) { return value > 0.0f ? value : fallback; }
+/// Fields where zero is a meaningful choice (no mass, no push, every contact
+/// a wall) fall back only when negative.
+inline float orDefaultIfNegative(float value, float fallback) { return value >= 0.0f ? value : fallback; }
+
+} // namespace
+
+extern "C" {
+
+ujolt_character *ujolt_world_add_character(ujolt_world *world, const ujolt_character_desc *desc) {
+    if (desc == nullptr || desc->radius <= 0.0f || desc->height <= 0.0f) return nullptr;
+
+    Ref<CharacterVirtualSettings> settings = new CharacterVirtualSettings();
+    settings->mShape = characterShape(desc->shape, desc->radius, desc->height, 1.0f);
+    settings->mMass = orDefaultIfNegative(desc->mass, 70.0f);
+    settings->mMaxStrength = orDefaultIfNegative(desc->max_strength, 100.0f);
+    settings->mCharacterPadding = orDefault(desc->padding, 0.02f);
+    settings->mPredictiveContactDistance = orDefault(desc->predictive_contact_distance, 0.1f);
+    settings->mMaxSlopeAngle = DegreesToRadians(orDefaultIfNegative(desc->max_slope_degrees, 50.0f));
+    settings->mPenetrationRecoverySpeed = orDefault(desc->penetration_recovery_speed, 1.0f);
+    // Only the lower part of the shape can rest on something: a wall touched
+    // at hip height is a wall, not ground.
+    settings->mSupportingVolume = Plane(Vec3::sAxisY(), -desc->radius);
+    settings->mBackFaceMode = EBackFaceMode::CollideWithBackFaces;
+    // Only voids internal edges within ONE body (a mesh); the environment
+    // is separate convex boxes, where it would cost and change nothing.
+    settings->mEnhancedInternalEdgeRemoval = false;
+    const ObjectLayer layer = objectLayer(desc->layer, true);
+    if (desc->inner_body != 0) {
+        settings->mInnerBodyShape = characterShape(desc->shape, desc->radius, desc->height,
+                                                   orDefault(desc->inner_body_fraction, 0.9f));
+        settings->mInnerBodyLayer = layer;
+    }
+
+    ujolt_character *character = new ujolt_character();
+    character->world = world;
+    character->layer = layer;
+    character->extended.mStickToFloorStepDown = Vec3(0.0f, -std::max(desc->stick_to_floor_step_down, 0.0f), 0.0f);
+    character->extended.mWalkStairsStepUp = Vec3(0.0f, std::max(desc->walk_stairs_step_up, 0.0f), 0.0f);
+    character->pushedByDynamicBodies = desc->pushed_by_dynamic_bodies != 0;
+    character->character = new CharacterVirtual(settings, RVec3(v3(desc->position)), q4(desc->rotation),
+                                                desc->user_data, &world->system);
+    character->character->SetListener(character);
+    const BodyID inner = character->character->GetInnerBodyID();
+    if (!inner.IsInvalid()) {
+        character->innerBody = inner.GetIndexAndSequenceNumber();
+        std::lock_guard<std::mutex> guard(world->recordMutex);
+        BodyRecord record{desc->user_data, false, EMotionType::Kinematic};
+        record.inner = true;
+        world->records[character->innerBody] = record;
+    }
+    world->broadPhaseDirty = true;
+    world->characters.insert(character);
+    return character;
+}
+
+void ujolt_world_remove_character(ujolt_world *world, ujolt_character *character) {
+    if (character == nullptr || world->characters.erase(character) == 0) return;
+    world->releaseCharacter(character, true);
+}
+
+void ujolt_character_move(ujolt_character *character, const float velocity[3], float dt, const float gravity[3]) {
+    if (dt <= 0.0f) return;
+    ujolt_world *world = character->world;
+    const RVec3 before = character->character->GetPosition();
+    character->character->SetLinearVelocity(v3(velocity));
+    character->character->ExtendedUpdate(dt, v3(gravity), character->extended,
+                                         world->system.GetDefaultBroadPhaseLayerFilter(character->layer),
+                                         world->system.GetDefaultLayerFilter(character->layer),
+                                         BodyFilter(), ShapeFilter(), *world->temp);
+    // Jolt keeps the velocity it was given; what the move produced is the
+    // displacement (stopped at a wall it is zero, along one it is the slide).
+    character->effectiveVelocity = Vec3(character->character->GetPosition() - before) / dt;
+}
+
+void ujolt_character_set_position(ujolt_character *character, const float position[3]) {
+    ujolt_world *world = character->world;
+    character->character->SetPosition(RVec3(v3(position)));
+    character->character->RefreshContacts(world->system.GetDefaultBroadPhaseLayerFilter(character->layer),
+                                          world->system.GetDefaultLayerFilter(character->layer),
+                                          BodyFilter(), ShapeFilter(), *world->temp);
+}
+
+void ujolt_character_set_rotation(ujolt_character *character, const float rotation[4]) {
+    character->character->SetRotation(q4(rotation));
+}
+
+void ujolt_character_get_position(const ujolt_character *character, float position[3]) {
+    store3(position, Vec3(character->character->GetPosition()));
+}
+
+void ujolt_character_get_velocity(const ujolt_character *character, float velocity[3]) {
+    store3(velocity, character->effectiveVelocity);
+}
+
+int32_t ujolt_character_ground_state(const ujolt_character *character) {
+    switch (character->character->GetGroundState()) {
+    case CharacterBase::EGroundState::OnGround: return UJOLT_GROUND_ON_GROUND;
+    case CharacterBase::EGroundState::OnSteepGround: return UJOLT_GROUND_ON_STEEP_GROUND;
+    case CharacterBase::EGroundState::NotSupported: return UJOLT_GROUND_NOT_SUPPORTED;
+    default: return UJOLT_GROUND_IN_AIR;
+    }
+}
+
+uint32_t ujolt_character_contacts(const ujolt_character *character, ujolt_character_contact *out, uint32_t capacity) {
+    uint32_t count = 0;
+    for (const CharacterContact &contact : character->character->GetActiveContacts()) {
+        // Sensors are not solid to the character (Jolt only notifies), and
+        // one it merely overlaps is never even routed through the solver
+        // that would discard it: leave them out, they are not geometry.
+        if (contact.mWasDiscarded || contact.mIsSensorB) continue;
+        if (count++ >= capacity) continue;
+        ujolt_character_contact &c = out[count - 1];
+        c.user_data = contact.mUserData;
+        store3(c.position, Vec3(contact.mPosition));
+        store3(c.normal, contact.mContactNormal);
+        c.distance = contact.mDistance;
+        c.is_dynamic = contact.mMotionTypeB == EMotionType::Dynamic ? 1 : 0;
+        c.had_collision = contact.mHadCollision ? 1 : 0;
+    }
+    return count;
+}
+
+ujolt_body_id ujolt_character_inner_body(const ujolt_character *character) {
+    return character->innerBody;
 }
 
 } // extern "C"
