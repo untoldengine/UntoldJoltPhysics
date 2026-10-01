@@ -115,6 +115,20 @@ built against, as the engine's validator demands.
   radius plus the other body's must cover half the particle spacing or the
   body slips through the gaps. The engine seam has no soft-body vocabulary:
   a game reads the vertex positions back each frame and drives a mesh.
+- **Character controller** (`JoltPhysicsBackend.addCharacter` /
+  `removeCharacter`, then `JoltCharacter.move` / `teleport` / `position` /
+  `contacts`): Jolt's `CharacterVirtual`, a capsule or cylinder standing on
+  its base. The world step never moves it; the game moves it every frame with
+  the velocity its animation produced, the controller collides and slides that
+  motion against the environment boxes and the rigid bodies, and the game reads
+  the corrected position back. Gravity is never added to its velocity (pass one
+  to `move` only to press on what it stands on), so a game that owns the
+  character's height keeps it. It pushes dynamic bodies (up to `maxStrength`)
+  and, unless `pushedByDynamicBodies` is set, is never shoved by them; kinematic
+  bodies push it either way. An inner kinematic body (`innerBody`, 90% of the
+  shape) makes dynamic bodies bounce off the character and rays hit it; it
+  carries the character's `entity`, is never read back and goes with the
+  character. Every character call is frame-thread only, between steps.
 
 ## Tests
 
@@ -127,13 +141,16 @@ coordinator does: bounce and rest, static boxes, triggers (including exit on
 removal), a kinematic swat, body removal and replacement, raycasts with
 exclusions and layer masks, the layer matrix, capsule/cylinder/convex-hull
 shapes, collider offsets, gravity, and soft bodies (a hanging rope, a sheet
-catching a ball, removal). The plugin suite covers the manifest,
-install/uninstall, replacement and the registration helper.
+catching a ball, removal). The character suite walks a controller into a wall
+and along it, over a low box, into a ball it pushes and a ball that bounces
+off it, hits it with a ray, teleports it and removes it. The plugin suite
+covers the manifest, install/uninstall, replacement and the registration
+helper.
 
 ## Roadmap
 
 Staged as agreed with the engine maintainers: prototype (this) → collision
-events (done) → mesh colliders → character controller.
+events (done) → character controller (done) → mesh colliders.
 
 ## License
 

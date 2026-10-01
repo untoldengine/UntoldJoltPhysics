@@ -78,14 +78,14 @@ public struct JoltEnvironmentBox: Equatable, Sendable {
 
 public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
     public let id = JoltPhysicsPluginContract.backendID
-    public let capabilities: PhysicsCapabilities = [.collisions, .triggers, .raycast]
+    public let capabilities: PhysicsCapabilities = [.collisions, .triggers, .raycast, .characterController]
     /// Entity reported for contacts with (and raycast hits on) environment
     /// geometry, which belongs to no entity. The engine's null entity, so no
     /// script can ever be triggered by it.
     public static let environmentEntity: EntityID = .invalid
 
     private let world: OpaquePointer
-    /// The bridge world, for the module's extensions (soft bodies).
+    /// The bridge world, for the module's extensions (soft bodies, characters).
     var worldHandle: OpaquePointer { world }
     private let settings: JoltWorldSettings
 
