@@ -40,11 +40,44 @@ public struct JoltSoftBodyDescriptor: Sendable {
     public var friction: Float = 0.4
     public var restitution: Float = 0.0
     public var gravityFactor: Float = 1.0
+    /// Cloth from triangles: the stretch, shear and dihedral bend
+    /// constraints are derived from `faces` (Jolt's CreateConstraints) with
+    /// `compliance`, `shearCompliance` and `bendCompliance`; `edges` is
+    /// then ignored.
+    public var constraintsFromFaces = false
+    public var shearCompliance: Float = 1e-5
+    /// Inverse bending stiffness; larger folds more easily.
+    public var bendCompliance: Float = 1e-3
+    /// Ceiling on a vertex's speed (m/s; 0 = Jolt's default): bounds the
+    /// energy a resolved overlap or a yanked pin can put into the body.
+    public var maxLinearVelocity: Float = 0
+    /// How bending resists when the constraints come from the faces.
+    public enum BendType: Int32, Sendable {
+        /// The angle between neighbouring triangles: stiffer, and less
+        /// stable when pinned vertices move fast.
+        case dihedral = 0
+        /// A distance across the shared edge: robust.
+        case distance = 1
+    }
+
+    public var bendType: BendType = .dihedral
 
     public init(vertices: [SIMD3<Float>], inverseMasses: [Float], edges: [SIMD2<UInt32>]) {
         self.vertices = vertices
         self.inverseMasses = inverseMasses
         self.edges = edges
+    }
+
+    /// A cloth: constraints from the triangles.
+    public init(vertices: [SIMD3<Float>], inverseMasses: [Float], faces: [SIMD3<UInt32>], compliance: Float, shearCompliance: Float, bendCompliance: Float) {
+        self.vertices = vertices
+        self.inverseMasses = inverseMasses
+        edges = []
+        self.faces = faces
+        self.compliance = compliance
+        self.shearCompliance = shearCompliance
+        self.bendCompliance = bendCompliance
+        constraintsFromFaces = true
     }
 }
 
@@ -88,6 +121,11 @@ extension JoltPhysicsBackend {
         desc.friction = descriptor.friction
         desc.restitution = descriptor.restitution
         desc.gravity_factor = descriptor.gravityFactor
+        desc.constraints_from_faces = descriptor.constraintsFromFaces ? 1 : 0
+        desc.shear_compliance = descriptor.shearCompliance
+        desc.bend_compliance = descriptor.bendCompliance
+        desc.max_linear_velocity = descriptor.maxLinearVelocity
+        desc.bend_type = descriptor.bendType.rawValue
         // Not an engine entity: its activations look like the environment's.
         desc.user_data = UInt64(Self.environmentEntity)
 
@@ -127,6 +165,28 @@ extension JoltPhysicsBackend {
             positions[index] = SIMD3<Float>(scratch[index * 3], scratch[index * 3 + 1], scratch[index * 3 + 2])
         }
         return read
+    }
+
+    /// Moves the given vertices to world positions and clears their
+    /// velocity: how pinned vertices ride on something animated. Frame
+    /// thread, between steps. Returns the count applied.
+    @discardableResult
+    public func setSoftBodyVertices(_ body: JoltSoftBody, indices: [UInt32], worldPositions: [SIMD3<Float>]) -> Int {
+        let count = min(indices.count, worldPositions.count)
+        guard count > 0 else { return 0 }
+        // A non-finite pin would poison the body's bounds next step.
+        guard worldPositions.prefix(count).allSatisfy({ $0.x.isFinite && $0.y.isFinite && $0.z.isFinite }) else { return 0 }
+        var flat = [Float](repeating: 0, count: count * 3)
+        for i in 0 ..< count {
+            flat[i * 3] = worldPositions[i].x
+            flat[i * 3 + 1] = worldPositions[i].y
+            flat[i * 3 + 2] = worldPositions[i].z
+        }
+        return indices.withUnsafeBufferPointer { indexPointer in
+            flat.withUnsafeBufferPointer { positionPointer in
+                Int(ujolt_world_set_soft_body_vertices(worldHandle, body.id, indexPointer.baseAddress, positionPointer.baseAddress, UInt32(count)))
+            }
+        }
     }
 
     public func removeSoftBody(_ body: JoltSoftBody) {

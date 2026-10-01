@@ -41,6 +41,7 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -566,18 +567,28 @@ ujolt_body_id ujolt_world_add_soft_body(ujolt_world *world, const ujolt_soft_bod
         const float invMass = desc->inv_masses ? desc->inv_masses[i] : 1.0f;
         shared->mVertices.push_back(SoftBodySharedSettings::Vertex(Float3(p[0], p[1], p[2]), Float3(0.0f, 0.0f, 0.0f), invMass));
     }
-    for (uint32_t i = 0; i < desc->edge_count; ++i) {
-        const uint32_t a = desc->edges[i * 2], b = desc->edges[i * 2 + 1];
-        if (a >= desc->vertex_count || b >= desc->vertex_count || a == b) return UJOLT_INVALID_BODY;
-        const float compliance = desc->edge_compliances ? desc->edge_compliances[i] : desc->compliance;
-        shared->mEdgeConstraints.push_back(SoftBodySharedSettings::Edge(a, b, compliance));
-    }
     for (uint32_t i = 0; i < desc->face_count; ++i) {
         const uint32_t *f = desc->faces + i * 3;
         if (f[0] >= desc->vertex_count || f[1] >= desc->vertex_count || f[2] >= desc->vertex_count) return UJOLT_INVALID_BODY;
+        if (f[0] == f[1] || f[1] == f[2] || f[0] == f[2]) return UJOLT_INVALID_BODY;
         shared->mFaces.push_back(SoftBodySharedSettings::Face(f[0], f[1], f[2]));
     }
-    shared->CalculateEdgeLengths();
+    if (desc->constraints_from_faces) {
+        // Cloth: stretch, shear and dihedral bend constraints derived from
+        // the triangles, one attribute set for every vertex.
+        if (desc->face_count == 0) return UJOLT_INVALID_BODY;
+        const SoftBodySharedSettings::VertexAttributes attributes(desc->compliance, desc->shear_compliance, desc->bend_compliance);
+        const auto bend = desc->bend_type == 1 ? SoftBodySharedSettings::EBendType::Distance : SoftBodySharedSettings::EBendType::Dihedral;
+        shared->CreateConstraints(&attributes, 1, bend);
+    } else {
+        for (uint32_t i = 0; i < desc->edge_count; ++i) {
+            const uint32_t a = desc->edges[i * 2], b = desc->edges[i * 2 + 1];
+            if (a >= desc->vertex_count || b >= desc->vertex_count || a == b) return UJOLT_INVALID_BODY;
+            const float compliance = desc->edge_compliances ? desc->edge_compliances[i] : desc->compliance;
+            shared->mEdgeConstraints.push_back(SoftBodySharedSettings::Edge(a, b, compliance));
+        }
+        shared->CalculateEdgeLengths();
+    }
     shared->Optimize();
 
     SoftBodyCreationSettings settings(shared, RVec3(v3(desc->position)), Quat::sIdentity(), objectLayer(desc->layer, true));
@@ -588,6 +599,7 @@ ujolt_body_id ujolt_world_add_soft_body(ujolt_world *world, const ujolt_soft_bod
     settings.mFriction = desc->friction;
     settings.mRestitution = desc->restitution;
     settings.mGravityFactor = desc->gravity_factor;
+    if (desc->max_linear_velocity > 0.0f) settings.mMaxLinearVelocity = desc->max_linear_velocity;
     // Hangs from its pinned vertices: the body's frame stays where it was made.
     settings.mUpdatePosition = false;
     settings.mMakeRotationIdentity = true;
@@ -628,6 +640,31 @@ uint32_t ujolt_world_read_soft_body_vertices(ujolt_world *world, ujolt_body_id b
         positions[i * 3 + 2] = float(w.GetZ());
     }
     return count;
+}
+
+uint32_t ujolt_world_set_soft_body_vertices(ujolt_world *world, ujolt_body_id body, const uint32_t *indices, const float *positions, uint32_t count) {
+    if (count == 0 || indices == nullptr || positions == nullptr) return 0;
+    BodyLockWrite lock(world->system.GetBodyLockInterface(), BodyID(body));
+    if (!lock.Succeeded() || !lock.GetBody().IsSoftBody()) return 0;
+    Body &b = lock.GetBody();
+    auto *mp = static_cast<SoftBodyMotionProperties *>(b.GetMotionProperties());
+    auto &vertices = mp->GetVertices();
+    // Vertex positions are relative to the body's centre of mass.
+    const RMat44 toLocal = b.GetCenterOfMassTransform().Inversed();
+    uint32_t applied = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        const uint32_t index = indices[i];
+        if (index >= vertices.size()) continue;
+        const float *p = positions + i * 3;
+        SoftBodyVertex &v = vertices[index];
+        v.mPosition = Vec3(toLocal * RVec3(p[0], p[1], p[2]));
+        v.mVelocity = Vec3::sZero();
+        ++applied;
+    }
+    if (applied > 0 && !b.IsActive()) {
+        world->system.GetBodyInterfaceNoLock().ActivateBody(b.GetID());
+    }
+    return applied;
 }
 
 void ujolt_world_remove_body(ujolt_world *world, ujolt_body_id body) {
@@ -711,7 +748,10 @@ void ujolt_world_activate_in_box(ujolt_world *world, const float min[3], const f
 }
 
 void ujolt_world_step(ujolt_world *world, float dt, int32_t collision_steps) {
-    if (dt <= 0.0f) return;
+    // A non-finite or absurd step would poison every body (an infinite
+    // kinematic velocity, a NaN integration); a hitch is clamped.
+    if (!std::isfinite(dt) || dt <= 0.0f) return;
+    if (dt > 0.1f) dt = 0.1f;
     BodyInterface &bi = world->system.GetBodyInterface();
     for (const KinematicTarget &target : world->kinematicTargets) {
         if (!bi.IsAdded(target.id)) continue;
@@ -750,6 +790,39 @@ void ujolt_world_step(ujolt_world *world, float dt, int32_t collision_steps) {
     {
         std::lock_guard<std::mutex> guard(world->eventMutex);
         world->deactivatedThisStep.clear();
+    }
+    // Any body whose bounds are not finite (or absurd) would trip the
+    // broadphase's assert and crash: name it and take it out of the world
+    // instead. Cheap: a handful of bodies.
+    {
+        BodyIDVector ids;
+        world->system.GetBodies(ids);
+        const BodyLockInterface &lockInterface = world->system.GetBodyLockInterface();
+        for (const BodyID &id : ids) {
+            AABox bounds;
+            bool soft = false;
+            {
+                BodyLockRead lock(lockInterface, id);
+                if (!lock.Succeeded()) continue;
+                bounds = lock.GetBody().GetWorldSpaceBounds();
+                soft = lock.GetBody().IsSoftBody();
+            }
+            const float limit = 1.0e6f;
+            const bool finite = bounds.mMin.IsNaN() == false && bounds.mMax.IsNaN() == false
+                && bounds.mMin.GetX() > -limit && bounds.mMax.GetX() < limit
+                && bounds.mMin.GetY() > -limit && bounds.mMax.GetY() < limit
+                && bounds.mMin.GetZ() > -limit && bounds.mMax.GetZ() < limit;
+            if (!finite) {
+                fprintf(stderr, "UntoldJoltPhysics: body %u (%s) has non-finite or absurd bounds (%g %g %g – %g %g %g); removing it from the world\n",
+                        id.GetIndexAndSequenceNumber(), soft ? "soft body" : "rigid body",
+                        double(bounds.mMin.GetX()), double(bounds.mMin.GetY()), double(bounds.mMin.GetZ()),
+                        double(bounds.mMax.GetX()), double(bounds.mMax.GetY()), double(bounds.mMax.GetZ()));
+                bi.RemoveBody(id);
+                bi.DestroyBody(id);
+                std::lock_guard<std::mutex> guard(world->recordMutex);
+                world->records.erase(id.GetIndexAndSequenceNumber());
+            }
+        }
     }
     world->system.Update(dt, std::max<int32_t>(collision_steps, 1), world->temp, world->jobs);
 

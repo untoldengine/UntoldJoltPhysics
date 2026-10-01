@@ -116,6 +116,20 @@ typedef struct ujolt_soft_body_desc {
     float restitution;
     float gravity_factor;
     uint64_t user_data;
+    /* Cloth from triangles: when non-zero, the distance, shear and bend
+       constraints are built from `faces` (Jolt's CreateConstraints with
+       dihedral bends) using `compliance`, `shear_compliance` and
+       `bend_compliance`, and `edges` is ignored. */
+    int32_t constraints_from_faces;
+    float shear_compliance;
+    float bend_compliance;
+    /* Ceiling on a vertex's speed (m/s); <= 0 -> Jolt's default. Bounds the
+       energy a resolved overlap or a yanked pin can put into the body. */
+    float max_linear_velocity;
+    /* Bend constraints derived from the faces: 0 = dihedral (angle between
+       neighbouring triangles, stiffer, less stable when pins move fast),
+       1 = distance (across the shared edge, robust). */
+    int32_t bend_type;
 } ujolt_soft_body_desc;
 
 typedef enum ujolt_contact_phase {
@@ -167,6 +181,10 @@ uint32_t ujolt_world_soft_body_vertex_count(ujolt_world *world, ujolt_body_id bo
 /// World-space vertex positions, xyz triples. Returns the count written
 /// (capped at capacity).
 uint32_t ujolt_world_read_soft_body_vertices(ujolt_world *world, ujolt_body_id body, float *positions, uint32_t capacity);
+/// Moves `count` vertices (by index) to world-space positions (xyz triples)
+/// and clears their velocity; meant for pinned vertices that ride on
+/// something animated. Returns the count applied.
+uint32_t ujolt_world_set_soft_body_vertices(ujolt_world *world, ujolt_body_id body, const uint32_t *indices, const float *positions, uint32_t count);
 uint32_t ujolt_world_body_count(const ujolt_world *world);
 uint64_t ujolt_world_get_user_data(const ujolt_world *world, ujolt_body_id body);
 
