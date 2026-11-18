@@ -503,4 +503,49 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
         guard let body = bodyByEntity[entity] else { return false }
         return ujolt_world_body_is_active(world, body) != 0
     }
+
+    /// Sets a body's velocity directly, without touching its transform —
+    /// unlike `resetBody`, its current orientation (and whatever spin
+    /// contact friction has already built up) is left alone, so this is
+    /// safe to call every frame for continuous steering. Pass `angular`
+    /// to set it explicitly (e.g. `.zero` to stop spinning); omit it to
+    /// leave the body's current angular velocity untouched — the
+    /// underlying Jolt call always takes both, so that case reads the
+    /// current value back first rather than clobbering it with zero.
+    /// Returns false if the entity has no body right now.
+    @discardableResult
+    public func setVelocity(entity: EntityID, linear: simd_float3, angular: simd_float3? = nil) -> Bool {
+        guard let body = bodyByEntity[entity] else { return false }
+
+        let resolvedAngular: simd_float3
+        if let angular {
+            resolvedAngular = angular
+        } else {
+            var currentLinear: (Float, Float, Float) = (0, 0, 0)
+            var currentAngular: (Float, Float, Float) = (0, 0, 0)
+            withUnsafeMutablePointer(to: &currentLinear) { l in
+                withUnsafeMutablePointer(to: &currentAngular) { a in
+                    l.withMemoryRebound(to: Float.self, capacity: 3) { lf in
+                        a.withMemoryRebound(to: Float.self, capacity: 3) { af in
+                            ujolt_world_get_velocity(world, body, lf, af)
+                        }
+                    }
+                }
+            }
+            resolvedAngular = simd_float3(currentAngular.0, currentAngular.1, currentAngular.2)
+        }
+
+        var l = (linear.x, linear.y, linear.z)
+        var a = (resolvedAngular.x, resolvedAngular.y, resolvedAngular.z)
+        withUnsafePointer(to: &l) { lp in
+            withUnsafePointer(to: &a) { ap in
+                lp.withMemoryRebound(to: Float.self, capacity: 3) { lf in
+                    ap.withMemoryRebound(to: Float.self, capacity: 3) { af in
+                        ujolt_world_set_velocity(world, body, lf, af)
+                    }
+                }
+            }
+        }
+        return true
+    }
 }
