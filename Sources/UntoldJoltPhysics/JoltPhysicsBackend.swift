@@ -96,6 +96,10 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
     // arrives from the frame thread in order).
     private var bodyByEntity: [EntityID: ujolt_body_id] = [:]
     private var entityByBody: [ujolt_body_id: EntityID] = [:]
+    // Not `private`: populated from the addCharacter/removeCharacter
+    // extension in JoltCharacter.swift, in the same module but a
+    // different file — Swift's `private` is file-scoped, not type-scoped.
+    var characterByEntity: [EntityID: JoltCharacter] = [:]
     private var environmentBodies: [ujolt_body_id] = []
     private var environmentBoxes: [JoltEnvironmentBox] = []
     private let environmentLock = NSLock()
