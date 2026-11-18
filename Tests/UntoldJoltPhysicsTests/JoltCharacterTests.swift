@@ -8,6 +8,14 @@ import UntoldEngine
 @testable import UntoldJoltPhysics
 import XCTest
 
+private final class RecordingContactSink: PhysicsEventSink {
+    var contacts: [PhysicsContactEvent] = []
+    func receiveContact(_ event: PhysicsContactEvent) { contacts.append(event) }
+    func receiveTrigger(_: PhysicsTriggerEvent) {}
+    func receiveActivation(_: PhysicsBodyActivationEvent) {}
+    func reportDroppedEvents(count _: Int) {}
+}
+
 final class JoltCharacterTests: XCTestCase {
     private let step: Float = 1.0 / 60.0
     private let radius: Float = 0.2
@@ -134,6 +142,37 @@ final class JoltCharacterTests: XCTestCase {
         XCTAssertGreaterThan(contacts.count, 32, "every post is listed, past the initial scratch")
         // The posts, and the floor it stands on (entity 1000): nothing else.
         XCTAssertTrue(contacts.allSatisfy { $0.entity == JoltPhysicsBackend.environmentEntity || $0.entity == 1000 })
+    }
+
+    func testIgnoringDynamicBodiesLeavesThemToTheInnerBodyAndReportsTheHit() throws {
+        let backend = makeBackend(wall: false)
+        var descriptor = JoltCharacterDescriptor(radius: radius, height: height)
+        descriptor.entity = zombie
+        descriptor.ignoresDynamicBodies = true
+        let character = try XCTUnwrap(backend.addCharacter(descriptor))
+        let sink = RecordingContactSink()
+
+        // A ball thrown at the standing character hits the inner body: the
+        // world reports the contact with the character's entity, and the
+        // ball bounces back instead of dropping dead at its feet.
+        backend.didAddBody(entity: 8, descriptor: ball(at: simd_float3(0, 1.0, -1.5), velocity: simd_float3(0, 0, 4)))
+        for _ in 0 ..< 60 {
+            character.move(velocity: .zero, deltaTime: step)
+            backend.step(deltaTime: step)
+            backend.drainEvents(into: sink)
+        }
+        XCTAssertTrue(sink.contacts.contains { $0.entityB == zombie && $0.entityA == 8 && $0.phase == .began })
+        XCTAssertLessThan(backend.bodyState(for: 8)?.position.z ?? 1, -0.3, "the ball came back off the inner body")
+
+        // Walking into a resting ball: not blocked, the inner body shoves it.
+        backend.didAddBody(entity: 9, descriptor: ball(at: simd_float3(0.6, 0.11, 0)))
+        backend.step(deltaTime: step)
+        walk(character, backend, velocity: simd_float3(1.5, 0, 0), seconds: 1)
+        XCTAssertEqual(character.position.x, 1.5, accuracy: 0.05, "never blocked by the ball")
+        // A kinematic body placed anew each frame nudges what it walks
+        // into rather than launching it: the ball is moved, not kicked.
+        let rest = backend.bodyState(for: 9)?.position ?? .zero
+        XCTAssertGreaterThan(simd_distance(simd_float2(rest.x, rest.z), simd_float2(0.6, 0)), 0.02, "the inner body moved it")
     }
 
     func testZeroStrengthNeverPushes() throws {

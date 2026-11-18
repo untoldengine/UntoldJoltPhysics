@@ -21,8 +21,8 @@ Follows the engine's [plugin authoring guidelines](https://github.com/untoldengi
 | Path | What it is |
 |---|---|
 | `Package.swift` | Depends on `JoltPhysics` from the fork at an exact tag (`5.6.0-spm.1` = Jolt v5.6.0). To update Jolt: branch the fork from the new upstream tag, keep its `Package.swift`, tag `<version>-spm.1`, bump the pin here. |
-| `Sources/CJoltBridge/` | C ABI shim over Jolt (`CJoltBridge.h`): opaque world handle, plain structs, explicit create/destroy — world, bodies, kinematic targets, step, transform read-back, buffered contact/activation events, ray cast. |
-| `Sources/UntoldJoltPhysics/` | The plugin: `JoltPhysicsBackend` (conforms to `PhysicsBackend`), `JoltPhysicsPlugin` (the manifest) and `registerJoltPhysics()`. |
+| `Sources/CJoltBridge/` | C ABI shim over Jolt (`CJoltBridge.h`): opaque world handle, plain structs, explicit create/destroy — world, bodies, kinematic targets, step, transform read-back, buffered contact/activation events, ray cast, plus the extras (soft bodies, a character controller, ragdolls). |
+| `Sources/UntoldJoltPhysics/` | The plugin: `JoltPhysicsBackend` (conforms to `PhysicsBackend`), `JoltPhysicsPlugin` (the manifest) and `registerJoltPhysics()`, with `JoltSoftBody`, `JoltCharacter` and `JoltRagdoll` as its side channels. |
 | `Tests/` | Backend tests driven through the engine protocol, plus manifest/registration tests. |
 
 ## Install
@@ -77,7 +77,11 @@ built against, as the engine's validator demands.
 - **Layers.** The engine's `layer` (0…31) maps to a Jolt object layer; the
   world configuration's `collisionLayerMatrix` (`masks[i]` = layers that layer
   `i` collides with, symmetrised) drives Jolt's pair filter. Static bodies never
-  collide with each other. Per-body `collisionMask` is not consulted yet.
+  collide with each other. Per-body `collisionMask` is not consulted yet. A
+  changed matrix applies to the bodies already in the world and wakes every
+  one of them: Jolt pairs active bodies only, so a body asleep on a surface
+  the new matrix hides from it would otherwise rest on it until something
+  else woke it.
 - **Contact events** follow the engine's reference backend: `entityA` is the
   dynamic body (the second body when both or neither are) and the normal points
   out of `entityB` into `entityA`. The impulse in `.began` events is an estimate
@@ -105,6 +109,9 @@ built against, as the engine's validator demands.
   for detected real-world surfaces; contacts and ray hits on them carry
   `JoltPhysicsBackend.environmentEntity` (the engine's null entity). Re-sent
   boxes that did not change keep their Jolt bodies, so resting balls stay put.
+  Each box sits on an engine collision layer (`layer`, 0 by default) that the
+  layer matrix filters like any body's, so a surface can be kept from a
+  chosen set of bodies — a room a tracked ragdoll reaches through.
 - **Restitution/friction** combine with Jolt's defaults (max / geometric mean).
 - **Soft bodies** (`JoltPhysicsBackend.addSoftBody` / `readSoftBodyVertices` /
   `removeSoftBody`, a side channel like `resetBody`): particles joined by
@@ -115,6 +122,46 @@ built against, as the engine's validator demands.
   radius plus the other body's must cover half the particle spacing or the
   body slips through the gaps. The engine seam has no soft-body vocabulary:
   a game reads the vertex positions back each frame and drives a mesh.
+- **Skinned soft bodies** (`JoltSoftBodyDescriptor.skin`, then
+  `JoltPhysicsBackend.skinSoftBody` every frame): cloth worn by an animated
+  character. Each skinned vertex names up to four joints (Jolt's skinned
+  constraints); the game feeds the joints' world transforms before every
+  step — `willStep` is the hook made for it — and Jolt keeps the particle
+  within `maxDistance` of where the skin puts it and outside a back-stop
+  behind the skin, the body underneath. The skin's normal comes from the
+  faces around the vertex whose three vertices are all skinned, wound
+  counter-clockwise seen from outside, so a back-stopped vertex needs one
+  or the body is refused. A `maxDistance` of 0 hard skins the vertex: it
+  sits exactly on the skin and loses its mass, so colliders never fight the
+  skin over it. The body is created skinned to its bind pose, so a step
+  before the first feed is sound; `hardSkinAll` (a teleport) is the only
+  hard reset there is — a body's first feed is one regardless, as Jolt
+  blends the skinned positions from the previous feed's — and, like every
+  skin call, it happens on the frame thread between steps, never inside
+  one. `oneWayAgainstRagdolls` lets ragdoll parts — the only bodies here
+  that carry a Jolt collision group — push the cloth while the cloth never
+  pushes them back: a swinging dynamic part drags it along by friction, a
+  kinematic (animated) part only pushes, and every other body still
+  collides both ways. The one gap is Jolt's continuous collision: a dynamic
+  part moving more than three quarters of its inner radius in a sub-step is
+  still held at the cloth for that sub-step (no impulse, but the rest of
+  its travel is lost); raise `collisionSteps` or turn `continuousCollision`
+  off if it shows. Jolt never wakes a body for its skin, so cloth on a live
+  character sets `allowSleeping` false. The normals read-back
+  (`readSoftBodyVertices(_:into:normals:)`) returns unit area-weighted
+  normals with the positions, allocating nothing after the first call, and
+  `setSoftBodySkin` scales every slack (0 hard skins the whole body; below
+  a vertex's back-stop ratio its back-stop is off) or switches the skin
+  constraints off. `setSoftBodyActive` puts a body to sleep or wakes it
+  (Jolt's DeactivateBody / ActivateBody): asleep, the soft-body jobs skip
+  it — no solve, no collision of its own, no skinning — and its particles
+  stay put, so a resting cloth stops costing. A skin feed or a parameter
+  change wakes it, and so does any awake rigid body reaching its bounds on
+  a layer the two share (Jolt activates a sleeping soft body before it
+  leaves the pair to the soft-body update: a ball thrown at a sleeping
+  shirt wakes it, and a ragdoll part inside the shirt would wake it every
+  step), so `setSoftBodyLayer` moves a body to be kept asleep onto a layer
+  nothing awake meets.
 - **Character controller** (`JoltPhysicsBackend.addCharacter` /
   `removeCharacter`, then `JoltCharacter.move` / `teleport` / `position` /
   `contacts`): Jolt's `CharacterVirtual`, a capsule or cylinder standing on
@@ -129,6 +176,33 @@ built against, as the engine's validator demands.
   shape) makes dynamic bodies bounce off the character and rays hit it; it
   carries the character's `entity`, is never read back and goes with the
   character. Every character call is frame-thread only, between steps.
+- **Ragdolls** (`JoltPhysicsBackend.addRagdoll` / `removeRagdoll`, then
+  `JoltRagdoll`): Jolt's `Ragdoll` over swing-twist joints with motors, built
+  from a `JoltRagdollDescriptor` — one rigid part per skeleton joint (capsule,
+  sphere or box), parents before children, each joined to its parent by a
+  cone/twist limit at its pivot (centred on the neutral pose, or wherever the
+  optional parent-side axes put it — mid-flexion for a knee; `jointRotation`
+  reads a joint back in that space for tuning). Poses are one world transform per part with
+  the body origin at the joint pivot, in and out (`setPose` teleports,
+  `readPose` reads back; a scaled or drifted matrix is read for the
+  rotation it means). Each part is kinematic (it follows the pose given
+  with `setKinematicPose`, which is re-applied every substep until replaced,
+  under the world's kinematic teleport and speed guards) or dynamic (`setPartDynamic`: simulated, its joint motors when in position
+  mode pulling it toward the local rotations `driveMotors` derives from the
+  pose it is handed each frame). `setMotors` switches a joint's motors and
+  retunes their spring, torque limit and the friction torque that resists
+  the joint while they are off; a part's surface friction is set on its
+  descriptor (0.5 unless said otherwise). So a knockdown is every part dynamic with
+  the motors off and some friction, the mesh following `readPose`; a hit
+  reaction is the hit subtree dynamic with motors driving it toward the live
+  animation while the rest stays kinematic; `addImpulse` delivers the hit.
+  Jolt stabilises the chain (parent/child mass ratios clamped to 0.8…1.2,
+  parent inertias raised) and never collides a part with its parent or with
+  a part it overlaps at rest. Every part reports the ragdoll's `entity` in
+  contacts and ray hits, none is ever read back through the engine's
+  transform batch, and `removeRagdoll` (or the world going away) takes them
+  all. `startActive` / `setActive` put the parts in the world or hold them
+  out; the parts keep their state either way. Frame thread, between steps.
 
 ## Tests
 
@@ -141,16 +215,30 @@ coordinator does: bounce and rest, static boxes, triggers (including exit on
 removal), a kinematic swat, body removal and replacement, raycasts with
 exclusions and layer masks, the layer matrix, capsule/cylinder/convex-hull
 shapes, collider offsets, gravity, and soft bodies (a hanging rope, a sheet
-catching a ball, removal). The character suite walks a controller into a wall
+catching a ball, removal, cloth from triangles following its moved pins and
+colliding with kinematic capsules and hulls). The skinned suite hangs a sheet
+from two joints and checks hard skinning, a step before the first feed,
+following moving joints, the back-stop, hard-skinned vertices inside a
+collider, a teleport reset, malformed skins, one-way contact against a
+ragdoll part, the skin parameters, the normals read-back, sleep control, a
+sheet put to sleep (no vertex moves, the step costs a fraction, a feed wakes
+it) and woken by a ball unless its layer is closed, and the demo's 100 Hz
+cadence. The character suite walks a controller into a wall
 and along it, over a low box, into a ball it pushes and a ball that bounces
-off it, hits it with a ray, teleports it and removes it. The plugin suite
-covers the manifest, install/uninstall, replacement and the registration
-helper.
+off it, hits it with a ray, teleports it and removes it. The ragdoll suite
+builds a three-part chain on the floor and checks creation, activation and
+removal, kinematic parts following a pose, motors holding a leaning chain up
+against gravity, a limp chain folding under joint friction without sinking,
+a knockdown coming to rest on the floor, contacts naming the ragdoll's
+entity while its parts are never read back, impulses on dynamic parts, and
+world teardown with a live ragdoll. The plugin suite covers the manifest,
+install/uninstall, replacement and the registration helper.
 
 ## Roadmap
 
 Staged as agreed with the engine maintainers: prototype (this) → collision
-events (done) → character controller (done) → mesh colliders.
+events (done) → character controller (done) → ragdolls (done) → mesh
+colliders.
 
 ## License
 
