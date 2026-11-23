@@ -249,7 +249,13 @@ extension JoltPhysicsBackend {
         desc.walk_stairs_step_up = descriptor.walkStairsStepUp
         guard let handle = ujolt_world_add_character(worldHandle, &desc) else { return nil }
         let character = JoltCharacter(handle: handle, descriptor: descriptor)
-        characterByEntity[descriptor.entity] = character
+        // `environmentEntity` is the descriptor's default: many characters can
+        // share it, so tracking it would make one overwrite another's entry
+        // and removal would delete whichever is currently stored, not
+        // necessarily the one being removed.
+        if descriptor.entity != JoltPhysicsBackend.environmentEntity {
+            characterByEntity[descriptor.entity] = character
+        }
         return character
     }
 
@@ -257,7 +263,9 @@ extension JoltPhysicsBackend {
     public func removeCharacter(_ character: JoltCharacter) {
         guard let handle = character.handle else { return }
         ujolt_world_remove_character(worldHandle, handle)
-        characterByEntity.removeValue(forKey: character.entity)
+        if character.entity != JoltPhysicsBackend.environmentEntity {
+            characterByEntity.removeValue(forKey: character.entity)
+        }
         character.invalidate()
     }
 
