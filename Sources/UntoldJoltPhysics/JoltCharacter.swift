@@ -248,13 +248,34 @@ extension JoltPhysicsBackend {
         desc.stick_to_floor_step_down = descriptor.stickToFloorStepDown
         desc.walk_stairs_step_up = descriptor.walkStairsStepUp
         guard let handle = ujolt_world_add_character(worldHandle, &desc) else { return nil }
-        return JoltCharacter(handle: handle, descriptor: descriptor)
+        let character = JoltCharacter(handle: handle, descriptor: descriptor)
+        // `environmentEntity` is the descriptor's default: many characters can
+        // share it, so tracking it would make one overwrite another's entry
+        // and removal would delete whichever is currently stored, not
+        // necessarily the one being removed.
+        if descriptor.entity != JoltPhysicsBackend.environmentEntity {
+            characterByEntity[descriptor.entity] = character
+        }
+        return character
     }
 
     /// Removes the character and its inner body. Frame thread.
     public func removeCharacter(_ character: JoltCharacter) {
         guard let handle = character.handle else { return }
         ujolt_world_remove_character(worldHandle, handle)
+        if character.entity != JoltPhysicsBackend.environmentEntity {
+            characterByEntity.removeValue(forKey: character.entity)
+        }
         character.invalidate()
+    }
+
+    /// The character controller for `entity`, if one was added via
+    /// `addCharacter` and hasn't been removed. Needed anywhere a second
+    /// entity's character must be found generically — e.g. reading a
+    /// teammate's velocity for pass-lead prediction — rather than relying
+    /// on the caller having kept its own reference, which has no way to
+    /// stay in sync with `removeCharacter`.
+    public func character(for entity: EntityID) -> JoltCharacter? {
+        characterByEntity[entity]
     }
 }

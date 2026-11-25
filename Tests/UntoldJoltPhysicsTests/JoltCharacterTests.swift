@@ -250,4 +250,28 @@ final class JoltCharacterTests: XCTestCase {
         }()
         XCTAssertTrue(character.isValid, "the handle is not told; the owner must not use it")
     }
+
+    func testCharacterLookupFindsItByEntityAndForgetsItOnRemoval() {
+        let backend = makeBackend()
+        let character = makeCharacter(backend)
+
+        XCTAssertTrue(backend.character(for: zombie) === character)
+        backend.removeCharacter(character)
+        XCTAssertNil(backend.character(for: zombie))
+    }
+
+    func testCharacterLookupIgnoresTheDefaultEntitySoUnrelatedCharactersDoNotCollide() {
+        let backend = makeBackend()
+        // Neither sets `entity`: both keep the descriptor's default,
+        // JoltPhysicsBackend.environmentEntity.
+        let anonymousA = backend.addCharacter(JoltCharacterDescriptor(radius: radius, height: height))!
+        var descriptorB = JoltCharacterDescriptor(radius: radius, height: height)
+        descriptorB.position = simd_float3(2, 0, 0)
+        let anonymousB = backend.addCharacter(descriptorB)!
+
+        XCTAssertNil(backend.character(for: JoltPhysicsBackend.environmentEntity),
+                      "the default entity must never resolve to either character")
+        backend.removeCharacter(anonymousA)
+        XCTAssertTrue(anonymousB.isValid, "removing one default-entity character must not disturb the other")
+    }
 }
