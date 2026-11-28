@@ -89,6 +89,10 @@ inline Mat44 mat44(const float *m) {
 /// Schmidt from X, right-handed), so a scaled or drifted game matrix — a
 /// scaled entity, accumulated float error — yields the rotation it means
 /// rather than the garbage GetQuaternion makes of a non-orthonormal 3x3.
+/// Mirrored matrices are not supported: Z is rebuilt as X cross Y, so the
+/// result is always right-handed, and a matrix with a negative determinant
+/// (a negative scale on one axis) gives a rotation with its Z axis flipped,
+/// without an error.
 inline Quat rotationOf(const Mat44 &matrix) {
     Vec3 x = matrix.GetAxisX();
     x = x.LengthSq() > 1e-12f ? x.Normalized() : Vec3::sAxisX();
@@ -670,6 +674,13 @@ void ujolt_world_set_layer_matrix(ujolt_world *world, const uint32_t *layer_mask
 ujolt_body_id ujolt_world_add_body(ujolt_world *world, const ujolt_body_desc *desc) {
     RefConst<Shape> shape = makeShape(*desc);
     if (shape == nullptr) return UJOLT_INVALID_BODY;
+
+    // No collision group is set on these bodies, and that is relied on:
+    // OnSoftBodyContactValidate takes "has a collision group" to mean "is a
+    // ragdoll part" when it makes a one-way soft body's contact one-way. A
+    // body type that is given a group here, or anywhere else in the bridge,
+    // would push such cloth and take no impulse back from it; it needs its
+    // own mark in that callback first.
 
     // A static sensor only detects ACTIVE bodies and reports the contact as
     // removed when its occupant falls asleep — the engine's trigger semantics
@@ -1618,17 +1629,31 @@ ujolt_ragdoll *ujolt_world_add_ragdoll(ujolt_world *world, const ujolt_ragdoll_d
     // inertias so the chain does not blow up, filter parent/child (and
     // overlapping-at-rest) pairs, then solve the root's joints first.
     if (!settings->Stabilize()) return nullptr;
+    // The separation distance is zero on purpose: only pairs that overlap in
+    // the neutral pose stop colliding. A positive distance would also switch
+    // off pairs that merely sit close at rest (an upper arm beside the chest,
+    // the two thighs), and those must keep colliding once the body falls.
+    // Parts meant to rest against each other are named in disabled_pairs.
     settings->DisableParentChildCollisions(neutral.data(), 0.0f);
     if (desc->disabled_pairs != nullptr && desc->disabled_pair_count > 0) {
-        // DisableParentChildCollisions gave every part the same table.
-        // The settings own the table they just built; it is not shared yet.
+        // DisableParentChildCollisions (Jolt 5.6, Ragdoll.cpp) builds one
+        // GroupFilterTable and hands that same table to every part, so part
+        // 0's filter is the ragdoll's. Jolt gives no non-const way back to
+        // it; casting the const away is safe here because the settings built
+        // the table a line above and nothing else holds it yet (no ragdoll
+        // has been created from them). That one shared table is how Jolt
+        // does it today, not a promise of its API: if a later Jolt leaves
+        // part 0 without a table, the ragdoll is refused rather than made
+        // without the pairs its description asked for.
         auto *table = const_cast<GroupFilterTable *>(static_cast<const GroupFilterTable *>(settings->mParts[0].mCollisionGroup.GetGroupFilter()));
-        if (table != nullptr) {
-            for (uint32_t k = 0; k < desc->disabled_pair_count; ++k) {
-                const int32_t a = desc->disabled_pairs[2 * k], b = desc->disabled_pairs[2 * k + 1];
-                if (a < 0 || b < 0 || uint32_t(a) >= count || uint32_t(b) >= count || a == b) continue;
-                table->DisableCollision(CollisionGroup::SubGroupID(a), CollisionGroup::SubGroupID(b));
-            }
+        if (table == nullptr) {
+            fprintf(stderr, "UntoldJoltPhysics: ragdoll refused: no group filter table to hold its %u disabled pairs\n", desc->disabled_pair_count);
+            return nullptr;
+        }
+        for (uint32_t k = 0; k < desc->disabled_pair_count; ++k) {
+            const int32_t a = desc->disabled_pairs[2 * k], b = desc->disabled_pairs[2 * k + 1];
+            if (a < 0 || b < 0 || uint32_t(a) >= count || uint32_t(b) >= count || a == b) continue;
+            table->DisableCollision(CollisionGroup::SubGroupID(a), CollisionGroup::SubGroupID(b));
         }
     }
     settings->CalculateBodyIndexToConstraintIndex();
