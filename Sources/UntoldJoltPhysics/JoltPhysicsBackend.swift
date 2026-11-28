@@ -40,8 +40,11 @@ public struct JoltWorldSettings: Sendable {
     /// Dynamic bodies use Jolt's continuous collision (LinearCast), so a fast
     /// body cannot pass through thin geometry. Costs a little per body.
     public var continuousCollision = true
-    /// Jolt sub-steps per engine step: a 33 ms frame stepped in three is
-    /// what cloth and fast kinematic colliders need to stay stable.
+    /// Jolt sub-steps per engine step (its `collision steps`): the world is
+    /// integrated this many times per step at dt / n. More lets joint
+    /// motors run stiffer than half the engine's step rate allows — a
+    /// powered ragdoll tracking a fast animation wants three, and so do
+    /// cloth and fast kinematic colliders in a 33 ms frame.
     public var collisionSteps: Int32 = 1
     /// Non-trigger contacts closing slower than this (m/s) are not reported
     /// as `.began`: a resting contact re-established after a sleep or a
@@ -63,19 +66,27 @@ public struct JoltEnvironmentBox: Equatable, Sendable {
     public var halfExtents: simd_float3
     public var friction: Float
     public var restitution: Float
+    /// The engine collision layer the box is on (0 unless said otherwise),
+    /// filtered by the world's layer matrix like any body's: a room that a
+    /// tracked ragdoll must reach through goes on a layer its parts do not
+    /// meet. Part of the box's identity, so a box re-sent on another layer
+    /// is rebuilt.
+    public var layer: UInt32
 
     public init(
         center: simd_float3,
         orientation: simd_quatf = simd_quatf(ix: 0, iy: 0, iz: 0, r: 1),
         halfExtents: simd_float3,
         friction: Float = 0.5,
-        restitution: Float = 0.0
+        restitution: Float = 0.0,
+        layer: UInt32 = 0
     ) {
         self.center = center
         self.orientation = orientation
         self.halfExtents = halfExtents
         self.friction = friction
         self.restitution = restitution
+        self.layer = layer
     }
 }
 
@@ -88,6 +99,7 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
     public static let environmentEntity: EntityID = .invalid
 
     private let world: OpaquePointer
+    private let collisionSteps: Int32
     /// The bridge world, for the module's extensions (soft bodies, characters).
     var worldHandle: OpaquePointer { world }
     private let settings: JoltWorldSettings
@@ -98,13 +110,19 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
     private var entityByBody: [ujolt_body_id: EntityID] = [:]
     private var environmentBodies: [ujolt_body_id] = []
     private var environmentBoxes: [JoltEnvironmentBox] = []
+    /// The layer matrix the world has, to tell a change from a repeat.
+    private var layerMatrix: [UInt32] = []
     private let environmentLock = NSLock()
     private var pendingEnvironment: [JoltEnvironmentBox]?
     private var changedScratch: [ujolt_body_id]
     private var contactScratch: [ujolt_contact_event]
     private var activationScratch: [ujolt_activation_event]
 
-    private let collisionSteps: Int32
+    /// Called at the top of every `step`, with the step's delta, after the
+    /// pending environment is applied and before Jolt runs: where a game
+    /// pushes this frame's joints into its skinned soft bodies
+    /// (`skinSoftBody`), which must happen between steps. Frame thread.
+    public var willStep: ((Float) -> Void)?
 
     public init(settings: JoltWorldSettings = JoltWorldSettings()) {
         collisionSteps = max(settings.collisionSteps, 1)
@@ -155,6 +173,14 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
             config.collisionLayerMatrix.withUnsafeBufferPointer { masks in
                 ujolt_world_set_layer_matrix(world, masks.baseAddress, UInt32(masks.count))
             }
+        }
+        // Jolt looks for pairs among the active bodies only: a body asleep
+        // on a surface the new matrix hides from it would rest on it until
+        // something else woke it. A changed matrix wakes the whole world.
+        if config.collisionLayerMatrix != layerMatrix {
+            layerMatrix = config.collisionLayerMatrix
+            let reach: Float = 1e6
+            ujolt_world_activate_in_box(world, [-reach, -reach, -reach], [reach, reach, reach])
         }
     }
 
@@ -208,8 +234,13 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
         desc.position = (descriptor.position.x, descriptor.position.y, descriptor.position.z)
         let q = descriptor.orientation
         desc.rotation = (q.imag.x, q.imag.y, q.imag.z, q.real)
-        desc.linear_velocity = (descriptor.linearVelocity.x, descriptor.linearVelocity.y, descriptor.linearVelocity.z)
-        desc.angular_velocity = (descriptor.angularVelocity.x, descriptor.angularVelocity.y, descriptor.angularVelocity.z)
+        // Jolt asserts on a body created with a velocity that is not a
+        // number (and a release build would carry the NaN into the
+        // simulation): such a body starts at rest instead.
+        let linear = descriptor.linearVelocity, angular = descriptor.angularVelocity
+        let finite = { (v: simd_float3) in v.x.isFinite && v.y.isFinite && v.z.isFinite }
+        desc.linear_velocity = finite(linear) ? (linear.x, linear.y, linear.z) : (0, 0, 0)
+        desc.angular_velocity = finite(angular) ? (angular.x, angular.y, angular.z) : (0, 0, 0)
         desc.user_data = UInt64(entity)
 
         let body: ujolt_body_id = hullPoints.withUnsafeBufferPointer { points in
@@ -252,6 +283,7 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
 
     public func step(deltaTime: Float) {
         applyPendingEnvironment()
+        willStep?(deltaTime)
         ujolt_world_step(world, deltaTime, collisionSteps)
     }
 
@@ -422,6 +454,7 @@ public final class JoltPhysicsBackend: PhysicsBackend, @unchecked Sendable {
             desc.half_extents = (box.halfExtents.x, box.halfExtents.y, box.halfExtents.z)
             desc.friction = box.friction
             desc.restitution = box.restitution
+            desc.layer = box.layer
             desc.motion = UJOLT_MOTION_STATIC
             desc.gravity_factor = 1
             desc.position = (box.center.x, box.center.y, box.center.z)

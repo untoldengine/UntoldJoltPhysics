@@ -530,6 +530,87 @@ final class JoltPhysicsBackendTests: XCTestCase {
         XCTAssertEqual(sink.contacts.filter { $0.phase == .ended }.count, ended, "No ended without a reported began")
     }
 
+    func testEnvironmentBoxLayerIsFilteredByTheMatrix() {
+        // A shelf 1 m up on layer 2; the ball is on layer 1, which the matrix
+        // lets meet the floor (layer 0) only.
+        let backend = makeBackend()
+        var config = PhysicsWorldConfiguration()
+        config.collisionLayerMatrix = [0b111, 0b001, 0b001]
+        backend.configure(config)
+        let shelf = JoltEnvironmentBox(
+            center: simd_float3(0, 1.0 - 0.02, 0),
+            halfExtents: simd_float3(0.5, 0.02, 0.5),
+            layer: 2
+        )
+        XCTAssertEqual(JoltEnvironmentBox(center: .zero, halfExtents: simd_float3(1, 1, 1)).layer, 0, "Boxes are on layer 0 unless said otherwise")
+        var relabelled = shelf
+        relabelled.layer = 0
+        XCTAssertNotEqual(shelf, relabelled, "The layer is part of the box's identity: a change rebuilds it")
+        backend.setEnvironmentBoxes([shelf])
+        var ballDescriptor = ball(position: simd_float3(0, 1.5, 0), restitution: 0.0)
+        ballDescriptor.layer = 1
+        backend.didAddBody(entity: 1, descriptor: ballDescriptor)
+        advance(backend, seconds: 2.0)
+        XCTAssertEqual(backend.environmentBodyCount, 1)
+        XCTAssertEqual(backend.bodyState(for: 1)!.position.y, 0.11, accuracy: 0.03, "The shelf's layer is filtered out: the ball falls through it onto the floor")
+        backend.didRemoveBody(entity: 1)
+
+        // Let layer 1 meet layer 2: the same shelf, untouched, now holds a ball.
+        config.collisionLayerMatrix = [0b111, 0b101, 0b011]
+        backend.configure(config)
+        backend.didAddBody(entity: 2, descriptor: ballDescriptor)
+        advance(backend, seconds: 2.0)
+        XCTAssertEqual(backend.environmentBodyCount, 1)
+        XCTAssertEqual(backend.bodyState(for: 2)!.position.y, 1.11, accuracy: 0.03, "The matrix change reaches the existing box")
+        backend.didRemoveBody(entity: 2)
+
+        // A box that says nothing is on layer 0, the floor's: under the first
+        // matrix a layer-1 ball rests on it.
+        config.collisionLayerMatrix = [0b111, 0b001, 0b001]
+        backend.configure(config)
+        var ledge = shelf
+        ledge.layer = 0
+        ledge.center.x = 2
+        backend.setEnvironmentBoxes([shelf, ledge])
+        ballDescriptor.position = simd_float3(2, 1.5, 0)
+        backend.didAddBody(entity: 3, descriptor: ballDescriptor)
+        advance(backend, seconds: 2.0)
+        XCTAssertEqual(backend.environmentBodyCount, 2)
+        XCTAssertEqual(backend.bodyState(for: 3)!.position.y, 1.11, accuracy: 0.03, "A box on the default layer is as solid as before")
+    }
+
+    func testAMatrixChangeWakesWhatTheClosedPairHeldUp() {
+        // A layer-1 ball asleep on a layer-2 shelf when the matrix closes the
+        // pair: Jolt pairs active bodies only, so the ball would sleep on
+        // through the shelf unless the change woke it.
+        let backend = makeBackend()
+        var config = PhysicsWorldConfiguration()
+        config.collisionLayerMatrix = [0b111, 0b101, 0b011]
+        backend.configure(config)
+        backend.setEnvironmentBoxes([JoltEnvironmentBox(
+            center: simd_float3(0, 1.0 - 0.02, 0),
+            halfExtents: simd_float3(0.5, 0.02, 0.5),
+            layer: 2
+        )])
+        var ballDescriptor = ball(position: simd_float3(0, 1.2, 0), restitution: 0.0)
+        ballDescriptor.layer = 1
+        backend.didAddBody(entity: 1, descriptor: ballDescriptor)
+        advance(backend, seconds: 2.0)
+        XCTAssertEqual(backend.bodyState(for: 1)!.position.y, 1.11, accuracy: 0.03, "Rests on the shelf")
+        XCTAssertFalse(backend.isBodyActive(entity: 1), "…asleep")
+
+        config.collisionLayerMatrix = [0b111, 0b001, 0b001]
+        backend.configure(config)
+        XCTAssertTrue(backend.isBodyActive(entity: 1), "The matrix change woke it")
+        advance(backend, seconds: 2.0)
+        XCTAssertEqual(backend.bodyState(for: 1)!.position.y, 0.11, accuracy: 0.03, "The closed pair lets the sleeping ball through")
+
+        // The same matrix again is not a change: nothing wakes.
+        XCTAssertFalse(backend.isBodyActive(entity: 1), "Asleep on the floor")
+        backend.configure(config)
+        XCTAssertFalse(backend.isBodyActive(entity: 1), "A repeat of the matrix wakes nothing")
+    }
+
     func testKinematicSpeedCapLimitsWhatAGlitchCanImpart() {
         var settings = JoltWorldSettings()
         settings.workerThreads = 0

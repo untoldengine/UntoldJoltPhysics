@@ -58,6 +58,12 @@ public struct JoltCharacterDescriptor: Sendable {
     public var innerBody = true
     /// Must be positive (0 or less falls back to 0.9).
     public var innerBodyFraction: Float = 0.9
+    /// Whether the character's own collision ignores dynamic bodies. On, it
+    /// neither blocks on them nor pushes them: they meet only its inner
+    /// body, a plain kinematic body whose contacts the world reports, so a
+    /// game hears every hit. Off, the controller catches and pushes them
+    /// itself, and those contacts reach no listener.
+    public var ignoresDynamicBodies = false
     /// Whether dynamic bodies may shove the character. Off, a ball resting
     /// against it or hitting it never moves it, while the character still
     /// pushes the ball; kinematic bodies (a tracked hand) push it either way.
@@ -245,6 +251,7 @@ extension JoltPhysicsBackend {
         desc.inner_body = descriptor.innerBody ? 1 : 0
         desc.inner_body_fraction = descriptor.innerBodyFraction
         desc.pushed_by_dynamic_bodies = descriptor.pushedByDynamicBodies ? 1 : 0
+        desc.ignores_dynamic_bodies = descriptor.ignoresDynamicBodies ? 1 : 0
         desc.stick_to_floor_step_down = descriptor.stickToFloorStepDown
         desc.walk_stairs_step_up = descriptor.walkStairsStepUp
         guard let handle = ujolt_world_add_character(worldHandle, &desc) else { return nil }
